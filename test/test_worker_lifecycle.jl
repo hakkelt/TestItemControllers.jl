@@ -27,6 +27,24 @@
     @test isempty(filter(e -> e.event in (:failed, :errored), result.events))
 end
 
+@testitem "The watchdog does not starve a task pinned to thread 2" setup=[TestHelpers] begin
+    # The watchdog's loop never yields, so any sticky task on its thread never runs. It used
+    # to run on the second interactive thread, which on Julia 1.12+ is thread 2 — exactly
+    # where ThreadingUtilities pins a worker, so every Polyester `@batch` in a test item
+    # deadlocked. The item pins a task there itself and fails if it does not finish.
+    pkg_path = joinpath(TestHelpers.TESTDATA_DIR, "BasicPackage")
+    discovered = TestHelpers.discover_test_items(pkg_path)
+
+    pinned = only(filter(i -> i.label == "task pinned to thread 2", discovered.items))
+
+    result = TestHelpers.run_testrun(
+        [pinned], discovered.setups, discovered;
+        timeout=180, item_timeouts=Dict(pinned.id => 120.0),
+    )
+
+    @test length(filter(e -> e.testitem_id == pinned.id && e.event == :passed, result.events)) == 1
+end
+
 @testitem "GC between test items stays off unless requested" setup=[TestHelpers] begin
     # The flag has to actually reach the test process for the test above to mean anything,
     # so pin both directions rather than only the enabled one.

@@ -9,10 +9,15 @@
 #     complete. The watchdog therefore paces itself with a plain OS sleep (see
 #     `_watchdog_sleep`) and writes to a file through `IOStream`, which is a blocking `write(2)` and
 #     needs no running loop.
-#   * The watchdog must not share a thread with the test item. The launch reserves two
-#     interactive threads on Julia >= 1.9 (see `src/testprocess.jl`): the main task — and
-#     therefore the runner loop and every test item — sits on the first, and this watchdog
-#     runs on the second.
+#   * The watchdog must not share a thread with the test item, nor with anything the test
+#     item pins to a thread. Its loop never yields, so a sticky task on the same thread would
+#     never run: ThreadingUtilities (and so every Polyester `@batch`) pins a worker task to
+#     thread 2, which on Julia 1.12+ is the second interactive thread, and that deadlocked.
+#     From Julia 1.10 on the watchdog therefore runs on an OS thread of its own, which the
+#     runtime adopts into the `:foreign` pool: no scheduler places tasks there and its id is
+#     above every thread a package can pin to. Julia 1.9 keeps the second of the two
+#     interactive threads the launch reserves (see `src/testprocess.jl`); the main task —
+#     and therefore the runner loop and every test item — sits on the first.
 #   * It cannot help against an item that neither allocates nor yields. Such an item never
 #     reaches a GC safepoint, so the watchdog's first allocation blocks behind a GC that
 #     can never start. The controller's own timeout remains the backstop for that case.
@@ -46,6 +51,10 @@ const WATCHDOG_RUNNING = Ref{Bool}(false)
 # Asks the watchdog thread to leave its loop. Set before a deliberate `exit`, so the runtime
 # is not torn down while another thread is still running Julia code — see `stop_watchdog!`.
 const WATCHDOG_STOP = Ref{Bool}(false)
+# Handle of the watchdog's own OS thread (`uv_thread_t`, pointer-sized on every platform), and
+# whether there is one to join.
+const WATCHDOG_THREAD = Ref{UInt}(0)
+const WATCHDOG_OWN_THREAD = Ref{Bool}(false)
 
 function _init_watchdog_globals!()
     WATCHDOG_FILE[] = nothing
@@ -54,6 +63,8 @@ function _init_watchdog_globals!()
     WATCHDOG_ITEM_TIMEOUT_MS[] = 0.0
     WATCHDOG_RUNNING[] = false
     WATCHDOG_STOP[] = false
+    WATCHDOG_THREAD[] = 0
+    WATCHDOG_OWN_THREAD[] = false
     return nothing
 end
 
@@ -305,6 +316,12 @@ function _guarded_watchdog_loop()
     return nothing
 end
 
+# Entry point of the watchdog's own OS thread (see `start_watchdog!`).
+function _watchdog_thread_entry(::Ptr{Cvoid})
+    _guarded_watchdog_loop()
+    return nothing
+end
+
 """
     start_watchdog!()
 
@@ -319,8 +336,23 @@ function start_watchdog!()
     isempty(file) && return false
     WATCHDOG_FILE[] = file
 
+    @static if VERSION >= v"1.10"
+        # Preferred: an OS thread of our own, adopted by the runtime when it first runs Julia
+        # code. Nothing can be scheduled or pinned onto it, and no test item can starve it.
+        # `uv_thread_create` is a plain libuv utility, not an event loop operation.
+        WATCHDOG_RUNNING[] = true
+        entry = @cfunction(_watchdog_thread_entry, Cvoid, (Ptr{Cvoid},))
+        rc = ccall(:uv_thread_create, Cint, (Ptr{UInt}, Ptr{Cvoid}, Ptr{Cvoid}), WATCHDOG_THREAD, entry, C_NULL)
+        if rc == 0
+            WATCHDOG_OWN_THREAD[] = true
+            return true
+        end
+        WATCHDOG_RUNNING[] = false
+        @debug "Could not start a thread for the hang watchdog; falling back to a Julia thread" rc
+    end
+
     @static if VERSION >= v"1.9"
-        # Preferred: our own interactive thread, which the default pool cannot starve.
+        # Otherwise our own interactive thread, which the default pool cannot starve.
         if Threads.nthreads(:interactive) >= 2
             Threads.@spawn :interactive _guarded_watchdog_loop()
             WATCHDOG_RUNNING[] = true
@@ -391,6 +423,14 @@ function stop_watchdog!()
     deadline = time() + 10 * WATCHDOG_POLL_SECONDS
     while WATCHDOG_RUNNING[] && time() < deadline
         Libc.systemsleep(WATCHDOG_POLL_SECONDS)
+    end
+
+    # An adopted thread still runs runtime code after leaving the loop, as it unregisters
+    # itself on exit, so wait for the OS thread to end too. Only once it has left the loop:
+    # one stuck in a dump would block the exit indefinitely.
+    if WATCHDOG_OWN_THREAD[] && !WATCHDOG_RUNNING[]
+        WATCHDOG_OWN_THREAD[] = false
+        ccall(:uv_thread_join, Cint, (Ptr{UInt},), WATCHDOG_THREAD)
     end
     return nothing
 end
