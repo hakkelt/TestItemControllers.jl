@@ -84,3 +84,15 @@ end
     println("✔" ^ 100_000)
     @test true
 end
+
+@testitem "task pinned to thread 2" begin
+    # Thread 2 is where ThreadingUtilities pins a worker for every Polyester `@batch`. On
+    # Julia 1.12+ it is an interactive thread, where the hang watchdog used to run.
+    t = Task(() -> Threads.threadid())
+    t.sticky = true
+    if Threads.maxthreadid() >= 2
+        ccall(:jl_set_task_tid, Cint, (Any, Cint), t, 1)
+    end
+    schedule(t)
+    @test timedwait(() -> istaskdone(t), 30) === :ok
+end

@@ -245,8 +245,9 @@ function flush!(d::OutputDemuxer)
 end
 
 # Number of interactive threads reserved in a test process. The main task — and therefore
-# the runner loop and every test item — occupies the first; the hang watchdog gets the
-# second, which is what lets it run while an item has the main thread wedged. Only the
+# the runner loop and every test item — occupies the first. On Julia 1.9 the hang watchdog
+# gets the second, which is what lets it run while an item has the main thread wedged; from
+# 1.10 on it runs on an OS thread of its own instead (see `watchdog.jl`). Only the
 # *default* pool is sized from the user's `juliaNumThreads`, so `Threads.nthreads()` inside
 # a test item is unchanged by this. Requires Julia >= 1.9, which is where `--threads=N,M`
 # and the interactive threadpool arrived.
